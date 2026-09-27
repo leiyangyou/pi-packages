@@ -145,6 +145,23 @@ function resolvePermissionState(
   return state;
 }
 
+export function filterAllowedSkills<T extends { name: string }>(
+  skills: readonly T[],
+  permissionManager: SkillPermissionChecker,
+  agentName: string | null,
+): T[] {
+  const cache = new Map<string, PermissionState>();
+  return skills.filter(
+    (skill) =>
+      resolvePermissionState(
+        skill.name,
+        permissionManager,
+        agentName,
+        cache,
+      ) !== "deny",
+  );
+}
+
 function createResolvedSkillEntry(
   entry: ParsedSkillPromptEntry,
   state: PermissionState,

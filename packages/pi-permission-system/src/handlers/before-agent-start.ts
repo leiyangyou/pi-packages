@@ -1,16 +1,23 @@
 import type {
   BeforeAgentStartEventResult,
   ExtensionContext,
+  Skill,
 } from "@earendil-works/pi-coding-agent";
 import type { SubagentDetector } from "#src/authority/subagent-detection";
-import { resolveSkillPromptEntries } from "#src/exposure/skill-prompt-sanitizer";
+import {
+  filterAllowedSkills,
+  resolveSkillPromptEntries,
+} from "#src/exposure/skill-prompt-sanitizer";
 import {
   type RegisteredTools,
   readRegisteredTools,
   type ToolRegistry,
 } from "#src/exposure/tool-registry";
 import type { ToolSurfaceObservation } from "#src/exposure/tool-surface-baseline";
-import { renderToolSurface } from "#src/exposure/tool-surface-prompt";
+import {
+  renderToolSurface,
+  toolSurfaceBullets,
+} from "#src/exposure/tool-surface-prompt";
 import type { DebugLogger } from "#src/logging/session-logger";
 import type { PermissionResolver } from "#src/policy/permission-resolver";
 import type { PermissionSession } from "#src/session/permission-session";
@@ -31,6 +38,10 @@ interface BeforeAgentStartPayload {
    */
   systemPromptOptions?: {
     customPrompt?: string;
+    forceSystemPrompt?: string;
+    appendSystemPrompt?: string;
+    skills?: Skill[];
+    sections?: Record<string, string>;
     toolSnippets?: Record<string, string>;
     promptGuidelines?: readonly string[];
   };
@@ -80,6 +91,10 @@ export function shouldExposeTool(
  * every turn, so relaxing a rule restores the tool it had withheld (#873).
  */
 export class AgentPrepHandler {
+  private lastLegacyPrompt = "";
+  private agentName: string | null = null;
+  private withheldTools = new Set<string>();
+  private withheldRules = new Set<string>();
   constructor(
     private readonly turnPrep: TurnPreparation,
     private readonly session: PermissionSession,
@@ -131,10 +146,188 @@ export class AgentPrepHandler {
       agentName,
       this.session.getPathNormalizer(),
     );
+    this.lastLegacyPrompt = skillPromptResult.prompt;
+    this.agentName = agentName;
+    this.withheldTools = new Set(surface.withheld);
+    const allowedRules = new Set(
+      toolSurfaceBullets({
+        allowedTools: registered.names.filter(
+          (name) => !this.withheldTools.has(name),
+        ),
+        toolSnippets: event.systemPromptOptions?.toolSnippets ?? {},
+        guidelinesByTool: registered.guidelinesByTool,
+        promptGuidelines: event.systemPromptOptions?.promptGuidelines ?? [],
+        piAuthoredPreamble: !hasCustomPrompt(event),
+      }).rules,
+    );
+    this.withheldRules = new Set(
+      toolSurfaceBullets({
+        allowedTools: [...this.withheldTools],
+        toolSnippets: event.systemPromptOptions?.toolSnippets ?? {},
+        guidelinesByTool: registered.guidelinesByTool,
+        promptGuidelines: event.systemPromptOptions?.promptGuidelines ?? [],
+        piAuthoredPreamble: !hasCustomPrompt(event),
+      }).rules.filter((rule) => !allowedRules.has(rule)),
+    );
     this.session.setActiveSkillEntries(skillPromptResult.entries);
+    const options = event.systemPromptOptions;
+    if (
+      options &&
+      options.forceSystemPrompt === undefined &&
+      options.sections != null &&
+      typeof options.sections === "object" &&
+      Array.isArray(options.skills)
+    ) {
+      try {
+        const normalizer = this.session.getPathNormalizer();
+        const skills = filterAllowedSkills(
+          options.skills,
+          this.resolver,
+          agentName,
+        );
+        const customPrompt =
+          options.customPrompt === undefined
+            ? undefined
+            : resolveSkillPromptEntries(
+                options.customPrompt,
+                this.resolver,
+                agentName,
+                normalizer,
+              ).prompt;
+        const appendSystemPrompt =
+          options.appendSystemPrompt === undefined
+            ? undefined
+            : resolveSkillPromptEntries(
+                options.appendSystemPrompt,
+                this.resolver,
+                agentName,
+                normalizer,
+              ).prompt;
+        const ownSurface =
+          hasCustomPrompt(event) && this.detector.isSubagent(ctx)
+            ? toolSurfaceBullets({
+                allowedTools,
+                toolSnippets: options.toolSnippets ?? {},
+                guidelinesByTool: registered.guidelinesByTool,
+                promptGuidelines: options.promptGuidelines ?? [],
+                piAuthoredPreamble: false,
+              })
+            : undefined;
+        options.skills = skills;
+        options.customPrompt = customPrompt;
+        options.appendSystemPrompt = appendSystemPrompt;
+        if (ownSurface) {
+          if (ownSurface.tools.length)
+            options.sections.tools = ownSurface.tools.join("\n");
+          else delete options.sections.tools;
+          options.sections.rules = ownSurface.rules.join("\n");
+        }
+        const final = resolveSkillPromptEntries(
+          event.systemPrompt,
+          this.resolver,
+          agentName,
+          normalizer,
+        );
+        this.session.setActiveSkillEntries(final.entries);
+        if (final.prompt === event.systemPrompt) return {};
+      } catch (error) {
+        console.error(
+          "Permission structured prompt failed; using legacy prompt:",
+          error,
+        );
+      }
+      this.session.setActiveSkillEntries(skillPromptResult.entries);
+      return { systemPrompt: this.lastLegacyPrompt };
+    }
     return skillPromptResult.prompt !== event.systemPrompt
       ? { systemPrompt: skillPromptResult.prompt }
       : {};
+  }
+
+  handleContext(event: { messages: unknown[] }): { messages: unknown[] } {
+    try {
+      let changed = false;
+      const sanitize = (text: string) =>
+        resolveSkillPromptEntries(
+          text,
+          this.resolver,
+          this.agentName,
+          this.session.getPathNormalizer(),
+        ).prompt;
+      const messages = event.messages.map((message) => {
+        if (
+          !message ||
+          typeof message !== "object" ||
+          !("role" in message) ||
+          message.role !== "system"
+        )
+          return message;
+        const system = message as {
+          role: unknown;
+          content: string;
+          sections?: Record<string, string | null>;
+        };
+        const content = sanitize(system.content);
+        let sections = system.sections;
+        if (sections) {
+          const rewritten = Object.fromEntries(
+            Object.entries(sections).map(([key, value]) => {
+              if (value === null) return [key, value];
+              let text = sanitize(value);
+              if (key === "tools")
+                text = text
+                  .split("\n")
+                  .filter((line) => {
+                    const name = /^- ([^:]+): /.exec(line)?.[1];
+                    return name === undefined || !this.withheldTools.has(name);
+                  })
+                  .join("\n");
+              if (key === "rules")
+                text = text
+                  .split("\n")
+                  .filter((line) => !this.withheldRules.has(line))
+                  .join("\n");
+              return [key, text];
+            }),
+          );
+          if (
+            Object.keys(rewritten).some(
+              (key) => rewritten[key] !== sections?.[key],
+            )
+          )
+            sections = rewritten;
+        }
+        if (content === system.content && sections === system.sections)
+          return message;
+        changed = true;
+        return { ...message, content, ...(sections ? { sections } : {}) };
+      });
+      return { messages: changed ? messages : event.messages };
+    } catch (error) {
+      console.error(
+        "Permission history sanitation failed; using legacy projection:",
+        error,
+      );
+      let head = true;
+      return {
+        messages: event.messages.map((message) => {
+          if (
+            !message ||
+            typeof message !== "object" ||
+            !("role" in message) ||
+            message.role !== "system"
+          )
+            return message;
+          const { sections: _sections, ...system } = message as Record<
+            string,
+            unknown
+          >;
+          const content = head ? this.lastLegacyPrompt : "";
+          head = false;
+          return { ...system, content };
+        }),
+      };
+    }
   }
 
   /**
