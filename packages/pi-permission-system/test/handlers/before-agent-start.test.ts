@@ -194,7 +194,7 @@ describe("AgentPrepHandler.handle", () => {
       makeCtx(),
     );
     vi.spyOn(resolver, "checkPermission").mockImplementation(() => {
-      throw new Error("sanitizer failed");
+      throw new Error("SYNTHETIC_SECRET_METADATA");
     });
     const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
     const messages = [
@@ -222,8 +222,35 @@ describe("AgentPrepHandler.handle", () => {
       messages[1],
       { role: "system", content: "", toolsRemoved: ["bash"] },
     ]);
-    expect(diagnostic.mock.calls[0][1]).toEqual(new Error("sanitizer failed"));
+    expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
+      "Permission history sanitation failed; using legacy projection.",
+    );
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain(
+      "SYNTHETIC_SECRET_METADATA",
+    );
     diagnostic.mockRestore();
+  });
+  it("bounds structured-fallback diagnostics without printing exception metadata", async () => {
+    const { handler } = makeSetup();
+    const event = makeEvent("Safe identity", { sections: {}, skills: [] });
+    let reads = 0;
+    Object.defineProperty(event.systemPromptOptions, "skills", {
+      get() {
+        if (++reads > 1) throw new Error("SYNTHETIC_SECRET_METADATA");
+        return [];
+      },
+    });
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await handler.handle(event, makeCtx());
+      expect(result.systemPrompt).toContain("Safe identity");
+      expect(JSON.stringify(result)).not.toContain("SYNTHETIC_SECRET_METADATA");
+      expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
+        "Permission structured prompt failed; using legacy prompt.",
+      );
+    } finally {
+      diagnostic.mockRestore();
+    }
   });
   it.each(["tools", "rules"])(
     "uses legacy projection for a stale getter exposing withheld %s",
