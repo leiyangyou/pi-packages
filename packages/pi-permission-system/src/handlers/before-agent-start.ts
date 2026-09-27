@@ -244,10 +244,9 @@ export class AgentPrepHandler {
         );
         this.session.setActiveSkillEntries(final.entries);
         if (final.prompt === event.systemPrompt) return {};
-      } catch (error) {
+      } catch {
         console.error(
-          "Permission structured prompt failed; using legacy prompt:",
-          error,
+          "Permission structured prompt failed; using legacy prompt.",
         );
       }
       this.session.setActiveSkillEntries(skillPromptResult.entries);
@@ -317,10 +316,9 @@ export class AgentPrepHandler {
         return { ...message, content, ...(sections ? { sections } : {}) };
       });
       return { messages: changed ? messages : event.messages };
-    } catch (error) {
+    } catch {
       console.error(
-        "Permission history sanitation failed; using legacy projection:",
-        error,
+        "Permission history sanitation failed; using legacy projection.",
       );
       let head = true;
       return {
