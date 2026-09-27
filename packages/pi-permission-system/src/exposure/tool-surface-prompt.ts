@@ -150,6 +150,32 @@ export function renderToolSurface(
   return body.length > 0 ? `${body}\n\n${block}` : block;
 }
 
+export function hasWithheldToolSurface(
+  systemPrompt: string,
+  withheldTools: ReadonlySet<string>,
+  withheldRules: ReadonlySet<string>,
+  piAuthoredPreamble: boolean,
+): boolean {
+  const lines = normalizePrompt(systemPrompt).split("\n");
+  const { layout, tailStart } = detectPromptLayout(lines);
+  const head = lines.slice(0, tailStart);
+  const remaining = [
+    ...(piAuthoredPreamble ? layout.removePiSurface(head) : head),
+    ...layout.removeRelocatedSurface(lines.slice(tailStart)),
+  ];
+  const removedCounts = new Map<string, number>();
+  for (const line of lines)
+    removedCounts.set(line, (removedCounts.get(line) ?? 0) + 1);
+  for (const line of remaining)
+    removedCounts.set(line, (removedCounts.get(line) ?? 0) - 1);
+  return [...removedCounts].some(
+    ([line, count]) =>
+      count > 0 &&
+      (withheldRules.has(line) ||
+        withheldTools.has(/^- ([^:]+): /.exec(line)?.[1] ?? "")),
+  );
+}
+
 /** Lines removed from one region of the prompt; the rest are returned in order. */
 type RegionRemoval = (lines: readonly string[]) => string[];
 
