@@ -414,7 +414,9 @@ interface ToolSurfaceBullets {
   readonly rules: readonly string[];
 }
 
-function toolSurfaceBullets(inputs: ToolSurfaceInputs): ToolSurfaceBullets {
+export function toolSurfaceBullets(
+  inputs: ToolSurfaceInputs,
+): ToolSurfaceBullets {
   return { tools: toolBullets(inputs), rules: ruleBullets(inputs) };
 }
 
