@@ -134,6 +134,105 @@ describe("shouldExposeTool", () => {
 // ── AgentPrepHandler.handle ────────────────────────────────────────────────
 
 describe("AgentPrepHandler.handle", () => {
+  it("redacts historical metadata without deleting shared guidelines or user messages", async () => {
+    const registry = makeToolRegistry({
+      getAll: () => [
+        { name: "read", promptGuidelines: ["Shared rule"] },
+        { name: "bash", promptGuidelines: ["Shared rule", "Private rule"] },
+      ],
+    });
+    const { handler, permissionManager } = makeSetup({ registry });
+    vi.mocked(permissionManager.isToolFullyDenied).mockImplementation(
+      (name) => name === "bash",
+    );
+    vi.mocked(permissionManager.check).mockImplementation((intent) =>
+      intent.surface === "skill"
+        ? makeCheckResult({ state: "deny" })
+        : makeCheckResult(),
+    );
+    await handler.handle(makeEvent("Identity"), makeCtx());
+    const skill =
+      "<available_skills><skill><name>secret</name><description>Secret description</description><location>/skills/secret/SKILL.md</location></skill></available_skills>";
+    const user = { role: "user", content: skill };
+    const messages = [
+      {
+        role: "system",
+        content: "Unrelated text",
+        sections: {
+          skills: skill,
+          tools: "<tools>\n- read: Read\n- bash: Shell\n</tools>",
+          rules:
+            "<rules>\n- Shared rule\n- Private rule\n- User-authored rule\n</rules>",
+        },
+        toolsAdded: [{ name: "read" }],
+        timestamp: 1,
+      },
+      user,
+    ];
+    const result = handler.handleContext({ messages });
+    expect(result.messages).toEqual([
+      {
+        ...messages[0],
+        sections: {
+          skills: "",
+          tools: "<tools>\n- read: Read\n</tools>",
+          rules: "<rules>\n- Shared rule\n- User-authored rule\n</rules>",
+        },
+      },
+      user,
+    ]);
+    expect(result.messages[1]).toBe(user);
+    expect(handler.handleContext(result).messages).toBe(result.messages);
+  });
+
+  it("projects the sanitized legacy head when historical sanitation throws", async () => {
+    const { handler, resolver } = makeSetup();
+    const prepared = await handler.handle(
+      makeEvent("Safe identity"),
+      makeCtx(),
+    );
+    vi.spyOn(resolver, "checkPermission").mockImplementation(() => {
+      throw new Error("sanitizer failed");
+    });
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+    const messages = [
+      {
+        role: "system",
+        content:
+          "<available_skills><skill><name>secret</name><description>secret</description><location>/secret</location></skill></available_skills>",
+        sections: { skills: "secret" },
+        toolsAdded: [{ name: "read" }],
+      },
+      { role: "user", content: "Keep me" },
+      {
+        role: "system",
+        content: "old",
+        sections: { rules: "old" },
+        toolsRemoved: ["bash"],
+      },
+    ];
+    expect(handler.handleContext({ messages }).messages).toEqual([
+      {
+        role: "system",
+        content: prepared.systemPrompt,
+        toolsAdded: [{ name: "read" }],
+      },
+      messages[1],
+      { role: "system", content: "", toolsRemoved: ["bash"] },
+    ]);
+    expect(diagnostic.mock.calls[0][1]).toEqual(new Error("sanitizer failed"));
+    diagnostic.mockRestore();
+  });
+  it("keeps supported root prompts structured instead of relocating the tool surface", async () => {
+    const { handler, toolRegistry } = makeSetup();
+    const event = makeEvent(
+      "Pi head\n\n<tools>\n- read: Read files\n</tools>\n\n<cwd>\n/test/project\n</cwd>",
+    );
+    Object.assign(event.systemPromptOptions, { sections: {}, skills: [] });
+    expect(await handler.handle(event, makeCtx())).toEqual({});
+    expect(toolRegistry.setActive).toHaveBeenCalled();
+    expect(event.systemPrompt).toContain("Pi head");
+  });
   it("prepares the session for the turn before reading its state", async () => {
     const ctx = makeCtx();
     const { handler, turnPrep, session } = makeSetup();
