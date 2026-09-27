@@ -15,6 +15,7 @@ import {
 } from "#src/exposure/tool-registry";
 import type { ToolSurfaceObservation } from "#src/exposure/tool-surface-baseline";
 import {
+  hasWithheldToolSurface,
   renderToolSurface,
   toolSurfaceBullets,
 } from "#src/exposure/tool-surface-prompt";
@@ -179,6 +180,19 @@ export class AgentPrepHandler {
       Array.isArray(options.skills)
     ) {
       try {
+        if (
+          hasWithheldToolSurface(
+            event.systemPrompt,
+            this.withheldTools,
+            this.withheldRules,
+            !hasCustomPrompt(event),
+          )
+        ) {
+          console.error(
+            "Permission prompt getter retains withheld metadata; using legacy projection.",
+          );
+          return { systemPrompt: this.lastLegacyPrompt };
+        }
         const normalizer = this.session.getPathNormalizer();
         const skills = filterAllowedSkills(
           options.skills,
