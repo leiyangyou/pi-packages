@@ -32,7 +32,9 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
 
 function makeEvent(
   systemPrompt = "You are an assistant.",
-  systemPromptOptions: Partial<BuildSystemPromptOptions> = {},
+  systemPromptOptions: Partial<BuildSystemPromptOptions> & {
+    sections?: Record<string, string>;
+  } = {},
 ) {
   return {
     systemPrompt,
@@ -223,6 +225,71 @@ describe("AgentPrepHandler.handle", () => {
     expect(diagnostic.mock.calls[0][1]).toEqual(new Error("sanitizer failed"));
     diagnostic.mockRestore();
   });
+  it.each(["tools", "rules"])(
+    "uses legacy projection for a stale getter exposing withheld %s",
+    async (section) => {
+      const registry = makeToolRegistry({
+        getActive: () => ["read", "bash"],
+        getAll: () => [
+          { name: "read", promptGuidelines: ["Shared rule"] },
+          { name: "bash", promptGuidelines: ["Shared rule", "Private rule"] },
+        ],
+      });
+      const { handler, permissionManager } = makeSetup({ registry });
+      vi.mocked(permissionManager.isToolFullyDenied).mockImplementation(
+        (name) => name === "bash",
+      );
+      const event = makeEvent(
+        `Pi head\n\n<tools>\n- read: Visible\n${section === "tools" ? "- bash: Hidden\n" : ""}</tools>\n\n<rules>\n- Shared rule\n${section === "rules" ? "- Private rule\n" : ""}</rules>\n\n<cwd>\n/test/project\n</cwd>\n\nUser text mentions bash and Private rule.`,
+        {
+          sections: {},
+          skills: [],
+          toolSnippets: { read: "Visible", bash: "Hidden" },
+        },
+      );
+      const optionsBefore = structuredClone(event.systemPromptOptions);
+      const diagnostic = vi
+        .spyOn(console, "error")
+        .mockImplementation(() => {});
+      try {
+        const result = await handler.handle(event, makeCtx());
+        expect(result.systemPrompt).toContain("- read: Visible");
+        expect(result.systemPrompt).toContain("- Shared rule");
+        expect(result.systemPrompt).not.toContain("- bash: Hidden");
+        expect(result.systemPrompt).not.toContain("- Private rule");
+        expect(result.systemPrompt).toContain(
+          "User text mentions bash and Private rule.",
+        );
+        expect(event.systemPromptOptions).toEqual(optionsBefore);
+        expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
+          "Permission prompt getter retains withheld metadata; using legacy projection.",
+        );
+      } finally {
+        diagnostic.mockRestore();
+      }
+    },
+  );
+
+  it("does not treat unrelated mentions or shared rules as stale owned metadata", async () => {
+    const registry = makeToolRegistry({
+      getActive: () => ["read", "bash"],
+      getAll: () => [
+        { name: "read", promptGuidelines: ["Shared rule"] },
+        { name: "bash", promptGuidelines: ["Shared rule"] },
+      ],
+    });
+    const { handler, permissionManager } = makeSetup({ registry });
+    vi.mocked(permissionManager.isToolFullyDenied).mockImplementation(
+      (name) => name === "bash",
+    );
+    const event = makeEvent(
+      "Pi head\n\n<tools>\n- read: Visible\n</tools>\n\n<rules>\n- Shared rule\n</rules>\n\n<cwd>\n/test/project\n</cwd>\n\n- bash: User-authored mention",
+      { sections: {}, skills: [] },
+    );
+    expect(await handler.handle(event, makeCtx())).toEqual({});
+    expect(event.systemPrompt).toContain("- bash: User-authored mention");
+  });
+
   it("keeps supported root prompts structured instead of relocating the tool surface", async () => {
     const { handler, toolRegistry } = makeSetup();
     const event = makeEvent(
