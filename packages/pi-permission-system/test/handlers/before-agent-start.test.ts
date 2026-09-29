@@ -32,7 +32,9 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
 
 function makeEvent(
   systemPrompt = "You are an assistant.",
-  systemPromptOptions: Partial<BuildSystemPromptOptions> = {},
+  systemPromptOptions: Partial<BuildSystemPromptOptions> & {
+    sections?: Record<string, string>;
+  } = {},
 ) {
   return {
     systemPrompt,
@@ -134,6 +136,197 @@ describe("shouldExposeTool", () => {
 // ── AgentPrepHandler.handle ────────────────────────────────────────────────
 
 describe("AgentPrepHandler.handle", () => {
+  it("redacts historical metadata without deleting shared guidelines or user messages", async () => {
+    const registry = makeToolRegistry({
+      getAll: () => [
+        { name: "read", promptGuidelines: ["Shared rule"] },
+        { name: "bash", promptGuidelines: ["Shared rule", "Private rule"] },
+      ],
+    });
+    const { handler, permissionManager } = makeSetup({ registry });
+    vi.mocked(permissionManager.isToolFullyDenied).mockImplementation(
+      (name) => name === "bash",
+    );
+    vi.mocked(permissionManager.check).mockImplementation((intent) =>
+      intent.surface === "skill"
+        ? makeCheckResult({ state: "deny" })
+        : makeCheckResult(),
+    );
+    await handler.handle(makeEvent("Identity"), makeCtx());
+    const skill =
+      "<available_skills><skill><name>secret</name><description>Secret description</description><location>/skills/secret/SKILL.md</location></skill></available_skills>";
+    const user = { role: "user", content: skill };
+    const messages = [
+      {
+        role: "system",
+        content: "Unrelated text",
+        sections: {
+          skills: skill,
+          tools: "<tools>\n- read: Read\n- bash: Shell\n</tools>",
+          rules:
+            "<rules>\n- Shared rule\n- Private rule\n- User-authored rule\n</rules>",
+        },
+        toolsAdded: [{ name: "read" }],
+        timestamp: 1,
+      },
+      user,
+    ];
+    const result = handler.handleContext({ messages });
+    expect(result.messages).toEqual([
+      {
+        ...messages[0],
+        sections: {
+          skills: "",
+          tools: "<tools>\n- read: Read\n</tools>",
+          rules: "<rules>\n- Shared rule\n- User-authored rule\n</rules>",
+        },
+      },
+      user,
+    ]);
+    expect(result.messages[1]).toBe(user);
+    expect(handler.handleContext(result).messages).toBe(result.messages);
+  });
+
+  it("projects the sanitized legacy head when historical sanitation throws", async () => {
+    const { handler, resolver } = makeSetup();
+    const prepared = await handler.handle(
+      makeEvent("Safe identity"),
+      makeCtx(),
+    );
+    vi.spyOn(resolver, "checkPermission").mockImplementation(() => {
+      throw new Error("SYNTHETIC_SECRET_METADATA");
+    });
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+    const messages = [
+      {
+        role: "system",
+        content:
+          "<available_skills><skill><name>secret</name><description>secret</description><location>/secret</location></skill></available_skills>",
+        sections: { skills: "secret" },
+        toolsAdded: [{ name: "read" }],
+      },
+      { role: "user", content: "Keep me" },
+      {
+        role: "system",
+        content: "old",
+        sections: { rules: "old" },
+        toolsRemoved: ["bash"],
+      },
+    ];
+    expect(handler.handleContext({ messages }).messages).toEqual([
+      {
+        role: "system",
+        content: prepared.systemPrompt,
+        toolsAdded: [{ name: "read" }],
+      },
+      messages[1],
+      { role: "system", content: "", toolsRemoved: ["bash"] },
+    ]);
+    expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
+      "Permission history sanitation failed; using legacy projection.",
+    );
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain(
+      "SYNTHETIC_SECRET_METADATA",
+    );
+    diagnostic.mockRestore();
+  });
+  it("bounds structured-fallback diagnostics without printing exception metadata", async () => {
+    const { handler } = makeSetup();
+    const event = makeEvent("Safe identity", { sections: {}, skills: [] });
+    let reads = 0;
+    Object.defineProperty(event.systemPromptOptions, "skills", {
+      get() {
+        if (++reads > 1) throw new Error("SYNTHETIC_SECRET_METADATA");
+        return [];
+      },
+    });
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await handler.handle(event, makeCtx());
+      expect(result.systemPrompt).toContain("Safe identity");
+      expect(JSON.stringify(result)).not.toContain("SYNTHETIC_SECRET_METADATA");
+      expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
+        "Permission structured prompt failed; using legacy prompt.",
+      );
+    } finally {
+      diagnostic.mockRestore();
+    }
+  });
+  it.each(["tools", "rules"])(
+    "uses legacy projection for a stale getter exposing withheld %s",
+    async (section) => {
+      const registry = makeToolRegistry({
+        getActive: () => ["read", "bash"],
+        getAll: () => [
+          { name: "read", promptGuidelines: ["Shared rule"] },
+          { name: "bash", promptGuidelines: ["Shared rule", "Private rule"] },
+        ],
+      });
+      const { handler, permissionManager } = makeSetup({ registry });
+      vi.mocked(permissionManager.isToolFullyDenied).mockImplementation(
+        (name) => name === "bash",
+      );
+      const event = makeEvent(
+        `Pi head\n\n<tools>\n- read: Visible\n${section === "tools" ? "- bash: Hidden\n" : ""}</tools>\n\n<rules>\n- Shared rule\n${section === "rules" ? "- Private rule\n" : ""}</rules>\n\n<cwd>\n/test/project\n</cwd>\n\nUser text mentions bash and Private rule.`,
+        {
+          sections: {},
+          skills: [],
+          toolSnippets: { read: "Visible", bash: "Hidden" },
+        },
+      );
+      const optionsBefore = structuredClone(event.systemPromptOptions);
+      const diagnostic = vi
+        .spyOn(console, "error")
+        .mockImplementation(() => {});
+      try {
+        const result = await handler.handle(event, makeCtx());
+        expect(result.systemPrompt).toContain("- read: Visible");
+        expect(result.systemPrompt).toContain("- Shared rule");
+        expect(result.systemPrompt).not.toContain("- bash: Hidden");
+        expect(result.systemPrompt).not.toContain("- Private rule");
+        expect(result.systemPrompt).toContain(
+          "User text mentions bash and Private rule.",
+        );
+        expect(event.systemPromptOptions).toEqual(optionsBefore);
+        expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
+          "Permission prompt getter retains withheld metadata; using legacy projection.",
+        );
+      } finally {
+        diagnostic.mockRestore();
+      }
+    },
+  );
+
+  it("does not treat unrelated mentions or shared rules as stale owned metadata", async () => {
+    const registry = makeToolRegistry({
+      getActive: () => ["read", "bash"],
+      getAll: () => [
+        { name: "read", promptGuidelines: ["Shared rule"] },
+        { name: "bash", promptGuidelines: ["Shared rule"] },
+      ],
+    });
+    const { handler, permissionManager } = makeSetup({ registry });
+    vi.mocked(permissionManager.isToolFullyDenied).mockImplementation(
+      (name) => name === "bash",
+    );
+    const event = makeEvent(
+      "Pi head\n\n<tools>\n- read: Visible\n</tools>\n\n<rules>\n- Shared rule\n</rules>\n\n<cwd>\n/test/project\n</cwd>\n\n- bash: User-authored mention",
+      { sections: {}, skills: [] },
+    );
+    expect(await handler.handle(event, makeCtx())).toEqual({});
+    expect(event.systemPrompt).toContain("- bash: User-authored mention");
+  });
+
+  it("keeps supported root prompts structured instead of relocating the tool surface", async () => {
+    const { handler, toolRegistry } = makeSetup();
+    const event = makeEvent(
+      "Pi head\n\n<tools>\n- read: Read files\n</tools>\n\n<cwd>\n/test/project\n</cwd>",
+    );
+    Object.assign(event.systemPromptOptions, { sections: {}, skills: [] });
+    expect(await handler.handle(event, makeCtx())).toEqual({});
+    expect(toolRegistry.setActive).toHaveBeenCalled();
+    expect(event.systemPrompt).toContain("Pi head");
+  });
   it("prepares the session for the turn before reading its state", async () => {
     const ctx = makeCtx();
     const { handler, turnPrep, session } = makeSetup();

@@ -391,6 +391,13 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
   );
   pi.on("session_shutdown", () => lifecycle.handleSessionShutdown());
   pi.on("before_agent_start", (event, ctx) => agentPrep.handle(event, ctx));
+  const onContextWithSystem = pi.on as unknown as (
+    event: string,
+    handler: (event: { messages: unknown[] }) => { messages: unknown[] },
+  ) => void;
+  onContextWithSystem("context_with_system", (event) =>
+    agentPrep.handleContext(event),
+  );
   pi.on("input", (event, ctx) => gates.handleInput(event, ctx));
   pi.on(
     "tool_call",
